@@ -11,6 +11,13 @@ import Defaults
 
 import QuickLook
 
+/// Geometry shared between the SwiftUI badge and the AppKit hit-testing that drives it.
+/// Both live in `ShelfItemView`; keep them in sync if either changes.
+enum ShelfItemLayout {
+    static let closeButtonSize: CGFloat = 18
+    static let closeButtonInset: CGFloat = 2
+}
+
 struct ShelfItemView: View {
     let item: ShelfItem
     @EnvironmentObject var vm: BoringViewModel
@@ -20,6 +27,7 @@ struct ShelfItemView: View {
     @State private var showStack = false
     @State private var cachedPreviewImage: NSImage?
     @State private var debouncedDropTarget = false
+    @State private var isHovering = false
 
     private var isSelected: Bool { viewModel.isSelected }
     private var shouldHideDuringDrag: Bool { selection.isDragging && selection.isSelected(item.id) && false }
@@ -54,7 +62,12 @@ struct ShelfItemView: View {
                     onRightClick: viewModel.handleRightClick,
                     onClick: { event, nsview in
                         viewModel.handleClick(event: event, view: nsview)
-                    }
+                    },
+                    onClose: removeItem,
+                    onHoverChange: { hovering in
+                        isHovering = hovering
+                    },
+                    isCloseButtonVisible: showCloseBadge
                 )
             } else {
                 Color.clear
@@ -62,6 +75,16 @@ struct ShelfItemView: View {
                     .padding(.vertical, 10)
                     .padding(.horizontal, 5)
             }
+        }
+        // Drawn by SwiftUI, but clicked through AppKit: `DraggableClickView` sits on top of
+        // this overlay and would swallow a SwiftUI Button's mouse events, so it hit-tests the
+        // same rect itself and calls `onClose`. See `ShelfItemLayout`.
+        .overlay(alignment: .topLeading) {
+            closeBadge
+                .padding(ShelfItemLayout.closeButtonInset)
+                .opacity(showCloseBadge ? 1 : 0)
+                .allowsHitTesting(false)
+                .animation(.easeInOut(duration: 0.12), value: showCloseBadge)
         }
         .onChange(of: viewModel.isDropTargeted) { _, targeted in
             vm.dragDetectorTargeting = targeted
@@ -92,7 +115,32 @@ struct ShelfItemView: View {
         .quickLookPresenter(using: quickLookService)
     }
 
+    // MARK: - Removal
+
+    /// Hidden while dragging or while this tile is a drop target, so the badge never
+    /// competes with those interactions.
+    private var showCloseBadge: Bool {
+        isHovering && !selection.isDragging && !debouncedDropTarget
+    }
+
+    @MainActor
+    private func removeItem() {
+        selection.deselect(item.id)
+        ShelfActionService.remove(item)
+    }
+
     // MARK: - View Components
+
+    private var closeBadge: some View {
+        Image(systemName: "xmark")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(.white)
+            .frame(width: ShelfItemLayout.closeButtonSize, height: ShelfItemLayout.closeButtonSize)
+            .background(Circle().fill(Color.black.opacity(0.75)))
+            .overlay(Circle().strokeBorder(Color.white.opacity(0.25), lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.35), radius: 2, x: 0, y: 1)
+            .accessibilityLabel(Text("Remove from shelf"))
+    }
 
     private var iconView: some View {
         Image(nsImage: viewModel.thumbnail ?? item.icon)
@@ -176,7 +224,10 @@ private struct DraggableClickHandler<Content: View>: NSViewRepresentable {
     @ViewBuilder let dragPreviewContent: () -> Content
     let onRightClick: (NSEvent, NSView) -> Void
     let onClick: (NSEvent, NSView) -> Void
-    
+    let onClose: () -> Void
+    let onHoverChange: (Bool) -> Void
+    let isCloseButtonVisible: Bool
+
     func makeNSView(context: Context) -> DraggableClickView {
         let view = DraggableClickView()
         view.item = item
@@ -184,9 +235,12 @@ private struct DraggableClickHandler<Content: View>: NSViewRepresentable {
         view.dragPreviewImage = cachedPreviewImage ?? renderDragPreview()
         view.onRightClick = onRightClick
         view.onClick = onClick
+        view.onClose = onClose
+        view.onHoverChange = onHoverChange
+        view.isCloseButtonVisible = isCloseButtonVisible
         return view
     }
-    
+
     func updateNSView(_ nsView: DraggableClickView, context: Context) {
         nsView.item = item
         nsView.viewModel = viewModel
@@ -196,6 +250,9 @@ private struct DraggableClickHandler<Content: View>: NSViewRepresentable {
         }
         nsView.onRightClick = onRightClick
         nsView.onClick = onClick
+        nsView.onClose = onClose
+        nsView.onHoverChange = onHoverChange
+        nsView.isCloseButtonVisible = isCloseButtonVisible
     }
     
     private func renderDragPreview() -> NSImage {
@@ -217,21 +274,71 @@ private struct DraggableClickHandler<Content: View>: NSViewRepresentable {
         var dragPreviewImage: NSImage?
         var onRightClick: ((NSEvent, NSView) -> Void)?
         var onClick: ((NSEvent, NSView) -> Void)?
+        var onClose: (() -> Void)?
+        var onHoverChange: ((Bool) -> Void)?
+        /// Mirrors `ShelfItemView.showCloseBadge` so a click is only intercepted while the
+        /// badge is actually on screen.
+        var isCloseButtonVisible: Bool = false
 
         private var mouseDownEvent: NSEvent?
         private let dragThreshold: CGFloat = 3.0
         private var draggedURLs: [URL] = []
         private var draggedItems: [ShelfItem] = []
-        
+
+        // MARK: - Close badge
+
+        /// Mirrors the SwiftUI badge drawn in `ShelfItemView` (top-leading, unflipped coords).
+        private var closeButtonRect: NSRect {
+            let size = ShelfItemLayout.closeButtonSize
+            let inset = ShelfItemLayout.closeButtonInset
+            return NSRect(
+                x: inset,
+                y: bounds.height - inset - size,
+                width: size,
+                height: size
+            )
+        }
+
+        // MARK: - Hover tracking
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            for area in trackingAreas {
+                removeTrackingArea(area)
+            }
+            addTrackingArea(
+                NSTrackingArea(
+                    rect: .zero,
+                    options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                    owner: self
+                )
+            )
+        }
+
+        override func mouseEntered(with event: NSEvent) {
+            onHoverChange?(true)
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            onHoverChange?(false)
+        }
+
         override func rightMouseDown(with event: NSEvent) {
             onRightClick?(event, self)
         }
-        
+
         override func mouseDown(with event: NSEvent) {
+            if isCloseButtonVisible,
+               closeButtonRect.contains(convert(event.locationInWindow, from: nil)) {
+                mouseDownEvent = nil
+                onHoverChange?(false)
+                onClose?()
+                return
+            }
             mouseDownEvent = event
             onClick?(event, self)
         }
-        
+
         override func mouseDragged(with event: NSEvent) {
             guard let mouseDownEvent = mouseDownEvent else {
                 super.mouseDragged(with: event)
