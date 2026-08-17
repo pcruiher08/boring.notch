@@ -45,13 +45,19 @@ enum ShelfActionService {
         ShelfStateViewModel.shared.remove(item)
     }
 
-    /// Removes the current shelf selection on Delete / Forward Delete.
+    /// Removes the current shelf selection on Command + Delete, matching Finder.
     /// Returns `true` if the event was handled, so the caller can consume it rather than
     /// letting it fall through to the frontmost application.
     static func handleKeyDown(_ event: NSEvent) -> Bool {
         let deleteKey: UInt16 = 51
         let forwardDeleteKey: UInt16 = 117
-        guard event.keyCode == deleteKey || event.keyCode == forwardDeleteKey else {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+        // Finder removes with Command + Delete, so bare Delete is deliberately ignored, as is
+        // Command + Delete carrying any other modifier.
+        guard modifiers == .command,
+              event.keyCode == deleteKey || event.keyCode == forwardDeleteKey
+        else {
             return false
         }
 
