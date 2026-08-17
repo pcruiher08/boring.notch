@@ -146,6 +146,66 @@ class BoringNotchSkyLightWindow: NSPanel {
         }
     }
     
-    override var canBecomeKey: Bool { false }
+    // MARK: - Conditional key focus
+
+    /// Set only while something in the notch genuinely needs keyboard input — currently, the
+    /// shelf having a selection so Delete can remove it. Taking key status does activate the
+    /// app, so the frontmost application loses focus for as long as this is set; releasing it
+    /// deactivates us again and focus returns. That is why it is scoped as tightly as
+    /// possible and dropped the moment the selection goes away.
+    var allowsKeyFocus: Bool = false {
+        didSet {
+            guard allowsKeyFocus != oldValue else { return }
+            if allowsKeyFocus {
+                makeKey()
+            } else if isKeyWindow {
+                releaseKeyFocus()
+            }
+        }
+    }
+
+    /// AppKit has no API for handing key status back to whoever held it before. `resignKey()`
+    /// looks like the candidate but is only a notification hook — it *tells* a window it has
+    /// lost key status rather than transferring it, so calling it leaves this panel holding
+    /// the keyboard indefinitely.
+    ///
+    /// Ordering the window out does drop key status (and deactivates the app); ordering it
+    /// straight back in restores the notch within the same runloop turn.
+    private func releaseKeyFocus() {
+        orderOut(nil)
+        orderFrontRegardless()
+    }
+
+    /// Called for key events reaching the window. Return `true` to consume the event so it
+    /// does not fall through to the frontmost application.
+    var onKeyDown: ((NSEvent) -> Bool)?
+
+    /// Takes key focus only while the notch is open *and* the shelf has a selection, and
+    /// routes Delete to the shelf while it does.
+    func observeShelfKeyboardFocus(of viewModel: BoringViewModel) {
+        Publishers.CombineLatest(
+            ShelfSelectionModel.shared.$selectedIDs,
+            viewModel.$notchState
+        )
+        .map { selectedIDs, notchState in
+            !selectedIDs.isEmpty && notchState == .open
+        }
+        .removeDuplicates()
+        .sink { [weak self] needsKeyboard in
+            self?.allowsKeyFocus = needsKeyboard
+        }
+        .store(in: &observers)
+
+        onKeyDown = { event in
+            ShelfActionService.handleKeyDown(event)
+        }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if onKeyDown?(event) == true { return }
+        super.keyDown(with: event)
+    }
+
+    override var canBecomeKey: Bool { allowsKeyFocus }
     override var canBecomeMain: Bool { false }
 }

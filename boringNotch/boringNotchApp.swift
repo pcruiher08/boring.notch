@@ -281,6 +281,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 .environmentObject(viewModel)
         )
 
+        // Let Delete remove the shelf selection (takes key focus only while that selection exists)
+        window.observeShelfKeyboardFocus(of: viewModel)
+
         window.orderFrontRegardless()
         NotchSpaceManager.shared.notchSpace.windows.insert(window)
 
